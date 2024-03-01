@@ -91,14 +91,14 @@ pub fn make_tray() -> hbb_common::ResultType<()> {
             use std::process::Command;
             Command::new("cmd")
                 .arg("/c")
-                .arg("start rustdesk://")
+                .arg(&format!("start {}", crate::get_uri_prefix()))
                 .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
                 .spawn()
                 .ok();
         }
         #[cfg(target_os = "linux")]
         if !std::process::Command::new("xdg-open")
-            .arg("rustdesk://")
+            .arg(&crate::get_uri_prefix())
             .spawn()
             .is_ok()
         {
@@ -173,7 +173,7 @@ async fn start_query_session_count(sender: std::sync::mpsc::Sender<Data>) {
     let mut last_count = 0;
     loop {
         if let Ok(mut c) = crate::ipc::connect(1000, "").await {
-            let mut timer = tokio::time::interval(Duration::from_secs(1));
+            let mut timer = crate::rustdesk_interval(tokio::time::interval(Duration::from_secs(1)));
             loop {
                 tokio::select! {
                     res = c.next() => {

@@ -26,6 +26,8 @@ use hbb_common::tokio;
 #[cfg(not(feature = "flutter"))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use hbb_common::tokio::sync::mpsc::UnboundedSender;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use hbb_common::tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use hbb_common::{
     allow_err,
     anyhow::{anyhow, Context},
@@ -65,7 +67,7 @@ use crate::{
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::ui_session_interface::SessionPermissionConfig;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-use crate::{check_clipboard, ClipboardContext, CLIPBOARD_INTERVAL};
+use crate::{check_clipboard, CLIPBOARD_INTERVAL};
 
 pub use super::lang::*;
 
@@ -700,12 +702,9 @@ impl Client {
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    fn try_stop_clipboard(_self_id: &str) {
+    fn try_stop_clipboard() {
         #[cfg(feature = "flutter")]
-        if crate::flutter::sessions::other_sessions_running(
-            _self_id.to_string(),
-            ConnType::DEFAULT_CONN,
-        ) {
+        if crate::flutter::sessions::has_sessions_running(ConnType::DEFAULT_CONN) {
             return;
         }
         TEXT_CLIPBOARD_STATE.lock().unwrap().running = false;
@@ -717,47 +716,48 @@ impl Client {
     //
     // If clipboard update is detected, the text will be sent to all sessions by `send_text_clipboard_msg`.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    fn try_start_clipboard(_ctx: Option<ClientClipboardContext>) {
+    fn try_start_clipboard(_ctx: Option<ClientClipboardContext>) -> Option<UnboundedReceiver<()>> {
         let mut clipboard_lock = TEXT_CLIPBOARD_STATE.lock().unwrap();
         if clipboard_lock.running {
-            return;
+            return None;
         }
+        clipboard_lock.running = true;
+        let (tx, rx) = unbounded_channel();
 
-        match ClipboardContext::new() {
-            Ok(mut ctx) => {
-                clipboard_lock.running = true;
-                // ignore clipboard update before service start
-                check_clipboard(&mut ctx, Some(&OLD_CLIPBOARD_TEXT));
-                std::thread::spawn(move || {
-                    log::info!("Start text clipboard loop");
-                    loop {
-                        std::thread::sleep(Duration::from_millis(CLIPBOARD_INTERVAL));
-                        if !TEXT_CLIPBOARD_STATE.lock().unwrap().running {
-                            break;
-                        }
+        log::info!("Start text clipboard loop");
+        std::thread::spawn(move || {
+            let mut is_sent = false;
+            let mut ctx = None;
+            loop {
+                if !TEXT_CLIPBOARD_STATE.lock().unwrap().running {
+                    break;
+                }
+                if !TEXT_CLIPBOARD_STATE.lock().unwrap().is_required {
+                    continue;
+                }
 
-                        if !TEXT_CLIPBOARD_STATE.lock().unwrap().is_required {
-                            continue;
-                        }
-
-                        if let Some(msg) = check_clipboard(&mut ctx, Some(&OLD_CLIPBOARD_TEXT)) {
-                            #[cfg(feature = "flutter")]
-                            crate::flutter::send_text_clipboard_msg(msg);
-                            #[cfg(not(feature = "flutter"))]
-                            if let Some(ctx) = &_ctx {
-                                if ctx.cfg.is_text_clipboard_required() {
-                                    let _ = ctx.tx.send(Data::Message(msg));
-                                }
-                            }
+                if let Some(msg) = check_clipboard(&mut ctx, Some(&OLD_CLIPBOARD_TEXT)) {
+                    #[cfg(feature = "flutter")]
+                    crate::flutter::send_text_clipboard_msg(msg);
+                    #[cfg(not(feature = "flutter"))]
+                    if let Some(ctx) = &_ctx {
+                        if ctx.cfg.is_text_clipboard_required() {
+                            let _ = ctx.tx.send(Data::Message(msg));
                         }
                     }
-                    log::info!("Stop text clipboard loop");
-                });
+                }
+
+                if !is_sent {
+                    is_sent = true;
+                    tx.send(()).ok();
+                }
+
+                std::thread::sleep(Duration::from_millis(CLIPBOARD_INTERVAL));
             }
-            Err(err) => {
-                log::error!("Failed to start clipboard service of client: {}", err);
-            }
-        }
+            log::info!("Stop text clipboard loop");
+        });
+
+        Some(rx)
     }
 
     #[inline]
@@ -1149,7 +1149,8 @@ pub struct LoginConfigHandler {
     pub custom_fps: Arc<Mutex<Option<usize>>>,
     pub adapter_luid: Option<i64>,
     pub mark_unsupported: Vec<CodecFormat>,
-    pub selected_user_session_id: String,
+    pub selected_windows_session_id: Option<u32>,
+    pub peer_info: Option<PeerInfo>,
 }
 
 impl Deref for LoginConfigHandler {
@@ -1236,7 +1237,7 @@ impl LoginConfigHandler {
         self.received = false;
         self.switch_uuid = switch_uuid;
         self.adapter_luid = adapter_luid;
-        self.selected_user_session_id = "".to_owned();
+        self.selected_windows_session_id = None;
     }
 
     /// Check if the client should auto login.
@@ -1518,7 +1519,8 @@ impl LoginConfigHandler {
         }
         let mut n = 0;
         let mut msg = OptionMessage::new();
-        msg.user_session = self.selected_user_session_id.clone();
+        // Version 1.2.5 can remove this, and OptionMessage is not needed for file transfer
+        msg.support_windows_specific_session = BoolOption::Yes.into();
         n += 1;
 
         if self.conn_type.eq(&ConnType::FILE_TRANSFER) {
@@ -1530,8 +1532,7 @@ impl LoginConfigHandler {
             n += 1;
         } else if q == "custom" {
             let config = self.load_config();
-            let allow_more =
-                !crate::ui_interface::using_public_server() || self.direct == Some(true);
+            let allow_more = !crate::using_public_server() || self.direct == Some(true);
             let quality = if config.custom_image_quality.is_empty() {
                 50
             } else {
@@ -2595,7 +2596,7 @@ pub async fn handle_hash(
     peer: &mut Stream,
 ) {
     lc.write().unwrap().hash = hash.clone();
-    let uuid = lc.read().unwrap().switch_uuid.clone();
+    let uuid = lc.write().unwrap().switch_uuid.take();
     if let Some(uuid) = uuid {
         if let Ok(uuid) = uuid::Uuid::from_str(&uuid) {
             send_switch_login_request(lc.clone(), peer, uuid).await;
@@ -2744,7 +2745,7 @@ pub trait Interface: Send + Clone + 'static + Sized {
     fn msgbox(&self, msgtype: &str, title: &str, text: &str, link: &str);
     fn handle_login_error(&self, err: &str) -> bool;
     fn handle_peer_info(&self, pi: PeerInfo);
-    fn set_multiple_user_sessions(&self, sessions: Vec<hbb_common::message_proto::RdpUserSession>);
+    fn set_multiple_windows_session(&self, sessions: Vec<WindowsSession>);
     fn on_error(&self, err: &str) {
         self.msgbox("error", "Error", err, "");
     }

@@ -41,7 +41,7 @@ use hbb_common::{
     tokio::{
         net::TcpStream,
         sync::mpsc,
-        time::{self, Duration, Instant, Interval},
+        time::{self, Duration, Instant},
     },
     tokio_util::codec::{BytesCodec, Framed},
 };
@@ -175,8 +175,8 @@ pub struct Connection {
     server: super::ServerPtrWeak,
     hash: Hash,
     read_jobs: Vec<fs::TransferJob>,
-    timer: Interval,
-    file_timer: Interval,
+    timer: crate::RustDeskInterval,
+    file_timer: crate::RustDeskInterval,
     file_transfer: Option<(String, bool)>,
     port_forward_socket: Option<Framed<TcpStream, BytesCodec>>,
     port_forward_address: String,
@@ -237,8 +237,10 @@ pub struct Connection {
     file_remove_log_control: FileRemoveLogControl,
     #[cfg(feature = "gpucodec")]
     supported_encoding_flag: (bool, Option<bool>),
-    user_session_id: Option<u32>,
-    checked_multiple_session: bool,
+    services_subed: bool,
+    delayed_read_dir: Option<(String, bool)>,
+    #[cfg(target_os = "macos")]
+    retina: Retina,
 }
 
 impl ConnInner {
@@ -327,8 +329,8 @@ impl Connection {
             server,
             hash,
             read_jobs: Vec::new(),
-            timer: time::interval(SEC30),
-            file_timer: time::interval(SEC30),
+            timer: crate::rustdesk_interval(time::interval(SEC30)),
+            file_timer: crate::rustdesk_interval(time::interval(SEC30)),
             file_transfer: None,
             port_forward_socket: None,
             port_forward_address: "".to_owned(),
@@ -386,8 +388,10 @@ impl Connection {
             file_remove_log_control: FileRemoveLogControl::new(id),
             #[cfg(feature = "gpucodec")]
             supported_encoding_flag: (false, None),
-            user_session_id: None,
-            checked_multiple_session: false,
+            services_subed: false,
+            delayed_read_dir: None,
+            #[cfg(target_os = "macos")]
+            retina: Retina::default(),
         };
         let addr = hbb_common::try_into_v4(addr);
         if !conn.on_open(addr).await {
@@ -419,7 +423,8 @@ impl Connection {
         if !conn.block_input {
             conn.send_permission(Permission::BlockInput, false).await;
         }
-        let mut test_delay_timer = time::interval(TEST_DELAY_TIMEOUT);
+        let mut test_delay_timer =
+            crate::rustdesk_interval(time::interval_at(Instant::now(), TEST_DELAY_TIMEOUT));
         let mut last_recv_time = Instant::now();
 
         conn.stream.set_send_timeout(
@@ -432,7 +437,7 @@ impl Connection {
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         std::thread::spawn(move || Self::handle_input(_rx_input, tx_cloned));
-        let mut second_timer = time::interval(Duration::from_secs(1));
+        let mut second_timer = crate::rustdesk_interval(time::interval(Duration::from_secs(1)));
 
         loop {
             tokio::select! {
@@ -583,7 +588,11 @@ impl Connection {
                                         break;
                                     }
                                     if conn.port_forward_socket.is_some() && conn.authorized {
-                                        break;
+                                        log::info!("Port forward, last_test_delay is none: {}", conn.last_test_delay.is_none());
+                                        // Avoid TestDelay reply injection into rdp data stream
+                                        if conn.last_test_delay.is_none() {
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -608,7 +617,7 @@ impl Connection {
                             }
                         }
                     } else {
-                        conn.file_timer = time::interval_at(Instant::now() + SEC30, SEC30);
+                        conn.file_timer = crate::rustdesk_interval(time::interval_at(Instant::now() + SEC30, SEC30));
                     }
                 }
                 Ok(conns) = hbbs_rx.recv() => {
@@ -629,7 +638,8 @@ impl Connection {
                 },
                 Some((instant, value)) = rx.recv() => {
                     let latency = instant.elapsed().as_millis() as i64;
-                    let msg: &Message = &value;
+                    #[allow(unused_mut)]
+                    let mut msg = value;
 
                     if latency > 1000 {
                         match &msg.union {
@@ -651,11 +661,20 @@ impl Connection {
                                 _ => {},
                             }
                         }
-                        Some(message::Union::PeerInfo(..)) => {
+                        Some(message::Union::PeerInfo(_pi)) => {
                             conn.refresh_video_display(None);
+                            #[cfg(target_os = "macos")]
+                            conn.retina.set_displays(&_pi.displays);
+                        }
+                        #[cfg(target_os = "macos")]
+                        Some(message::Union::CursorPosition(pos)) => {
+                            if let Some(new_msg) = conn.retina.on_cursor_pos(&pos, conn.display_idx) {
+                                msg = Arc::new(new_msg);
+                            }
                         }
                         _ => {}
                     }
+                    let msg: &Message = &msg;
                     if let Err(err) = conn.stream.send(msg).await {
                         conn.on_close(&err.to_string(), false).await;
                         break;
@@ -680,18 +699,18 @@ impl Connection {
                         conn.on_close("Timeout", true).await;
                         break;
                     }
-                    let mut qos = video_service::VIDEO_QOS.lock().unwrap();
-                    if conn.last_test_delay.is_none() {
+                    // The control end will jump out of the loop after receiving LoginResponse and will not reply to the TestDelay
+                    if conn.last_test_delay.is_none() && !(conn.port_forward_socket.is_some() && conn.authorized) {
                         conn.last_test_delay = Some(Instant::now());
                         let mut msg_out = Message::new();
                         msg_out.set_test_delay(TestDelay{
                             last_delay: conn.network_delay,
-                            target_bitrate: qos.bitrate(),
+                            target_bitrate: video_service::VIDEO_QOS.lock().unwrap().bitrate(),
                             ..Default::default()
                         });
-                        conn.inner.send(msg_out.into());
+                        conn.send(msg_out.into()).await;
                     }
-                    qos.user_delay_response_elapsed(conn.inner.id(), conn.delay_response_instant.elapsed().as_millis());
+                    video_service::VIDEO_QOS.lock().unwrap().user_delay_response_elapsed(conn.inner.id(), conn.delay_response_instant.elapsed().as_millis());
                 }
             }
         }
@@ -1194,6 +1213,10 @@ impl Connection {
         .into();
 
         let mut sub_service = false;
+        #[allow(unused_mut)]
+        let mut wait_session_id_confirm = false;
+        #[cfg(windows)]
+        self.handle_windows_specific_session(&mut pi, &mut wait_session_id_confirm);
         if self.file_transfer.is_some() {
             res.set_peer_info(pi);
         } else {
@@ -1225,6 +1248,10 @@ impl Connection {
                 Ok(displays) => {
                     // For compatibility with old versions, we need to send the displays to the peer.
                     // But the displays may be updated later, before creating the video capturer.
+                    #[cfg(target_os = "macos")]
+                    {
+                        self.retina.set_displays(&displays);
+                    }
                     pi.displays = displays;
                     pi.current_display = self.display_idx as _;
                     res.set_peer_info(pi);
@@ -1253,8 +1280,22 @@ impl Connection {
             } else {
                 ""
             };
-            self.read_dir(dir, show_hidden);
+            if !wait_session_id_confirm {
+                self.read_dir(dir, show_hidden);
+            } else {
+                self.delayed_read_dir = Some((dir.to_owned(), show_hidden));
+            }
         } else if sub_service {
+            if !wait_session_id_confirm {
+                self.try_sub_services();
+            }
+        }
+    }
+
+    fn try_sub_services(&mut self) {
+        let is_remote = self.file_transfer.is_none() && self.port_forward_socket.is_none();
+        if is_remote && !self.services_subed {
+            self.services_subed = true;
             if let Some(s) = self.server.upgrade() {
                 let mut noperms = Vec::new();
                 if !self.peer_keyboard_enabled() && !self.show_remote_cursor {
@@ -1275,6 +1316,33 @@ impl Connection {
                 self.auto_disconnect_timer = Self::get_auto_disconenct_timer();
                 s.try_add_primay_video_service();
                 s.add_connection(self.inner.clone(), &noperms);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn handle_windows_specific_session(
+        &mut self,
+        pi: &mut PeerInfo,
+        wait_session_id_confirm: &mut bool,
+    ) {
+        let sessions = crate::platform::get_available_sessions(true);
+        if let Some(current_sid) = crate::platform::get_current_process_session_id() {
+            if crate::platform::is_installed()
+                && crate::platform::is_share_rdp()
+                && raii::AuthedConnID::remote_and_file_conn_count() == 1
+                && sessions.len() > 1
+                && sessions.iter().any(|e| e.sid == current_sid)
+                && (get_version_number(&self.lr.version) > get_version_number("1.2.4")
+                    || self.lr.option.support_windows_specific_session == BoolOption::Yes.into())
+            {
+                pi.windows_sessions = Some(WindowsSessions {
+                    sessions,
+                    current_sid,
+                    ..Default::default()
+                })
+                .into();
+                *wait_session_id_confirm = true;
             }
         }
     }
@@ -1495,50 +1563,8 @@ impl Connection {
         self.video_ack_required = lr.video_ack_required;
     }
 
-    #[cfg(target_os = "windows")]
-    async fn handle_multiple_user_sessions(&mut self, usid: Option<u32>) -> bool {
-        if self.port_forward_socket.is_some() {
-            return true;
-        } else {
-            let active_sessions = crate::platform::get_all_active_sessions();
-            if active_sessions.len() <= 1 {
-                return true;
-            }
-            let current_process_usid = crate::platform::get_current_process_session_id();
-            if usid.is_none() {
-                let mut res = Misc::new();
-                let mut rdp = Vec::new();
-                for session in active_sessions {
-                    let u_sid = &session[0];
-                    let u_name = &session[1];
-                    let mut rdp_session = RdpUserSession::new();
-                    rdp_session.user_session_id = u_sid.clone();
-                    rdp_session.user_name = u_name.clone();
-                    rdp.push(rdp_session);
-                }
-                res.set_rdp_user_sessions(RdpUserSessions {
-                    rdp_user_sessions: rdp,
-                    ..Default::default()
-                });
-                let mut msg_out = Message::new();
-                msg_out.set_misc(res);
-                self.send(msg_out).await;
-                return true;
-            }
-            if usid != Some(current_process_usid) {
-                self.on_close("Reconnecting...", false).await;
-                std::thread::spawn(move || {
-                    let _ = ipc::connect_to_user_session(usid);
-                });
-                return false;
-            }
-            true
-        }
-    }
-
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn try_start_cm_ipc(&mut self) {
-        let usid = self.user_session_id;
         if let Some(p) = self.start_cm_ipc_para.take() {
             tokio::spawn(async move {
                 #[cfg(windows)]
@@ -1548,7 +1574,6 @@ impl Connection {
                     p.tx_from_cm,
                     p.rx_desktop_ready,
                     p.tx_cm_stream_ready,
-                    usid.clone(),
                 )
                 .await
                 {
@@ -1562,7 +1587,7 @@ impl Connection {
             #[cfg(all(windows, feature = "flutter"))]
             std::thread::spawn(move || {
                 if crate::is_server() && !crate::check_process("--tray", false) {
-                    crate::platform::run_as_user(vec!["--tray"], usid).ok();
+                    crate::platform::run_as_user(vec!["--tray"]).ok();
                 }
             });
         }
@@ -1570,19 +1595,6 @@ impl Connection {
 
     async fn on_message(&mut self, msg: Message) -> bool {
         if let Some(message::Union::LoginRequest(lr)) = msg.union {
-            #[cfg(target_os = "windows")]
-            {
-                if !self.checked_multiple_session {
-                    let usid;
-                    match lr.option.user_session.parse::<u32>() {
-                        Ok(n) => usid = Some(n),
-                        Err(..) => usid = None,
-                    }
-                    if usid.is_some() {
-                        self.user_session_id = usid;
-                    }
-                }
-            }
             self.handle_login_request_without_validation(&lr).await;
             if self.authorized {
                 return true;
@@ -1821,24 +1833,12 @@ impl Connection {
                 }
             }
         } else if self.authorized {
-            #[cfg(target_os = "windows")]
-            if !self.checked_multiple_session {
-                self.checked_multiple_session = true;
-                if crate::platform::is_installed()
-                    && crate::platform::is_share_rdp()
-                    && Self::alive_conns().len() == 1
-                    && get_version_number(&self.lr.version) >= get_version_number("1.2.4")
-                {
-                    if !self
-                        .handle_multiple_user_sessions(self.user_session_id)
-                        .await
-                    {
-                        return false;
-                    }
-                }
+            if self.port_forward_socket.is_some() {
+                return true;
             }
             match msg.union {
-                Some(message::Union::MouseEvent(me)) => {
+                #[allow(unused_mut)]
+                Some(message::Union::MouseEvent(mut me)) => {
                     #[cfg(any(target_os = "android", target_os = "ios"))]
                     if let Err(e) = call_main_service_pointer_input("mouse", me.mask, me.x, me.y) {
                         log::debug!("call_main_service_pointer_input fail:{}", e);
@@ -1850,6 +1850,8 @@ impl Connection {
                         } else {
                             MOUSE_MOVE_TIME.store(get_time(), Ordering::SeqCst);
                         }
+                        #[cfg(target_os = "macos")]
+                        self.retina.on_mouse_event(&mut me, self.display_idx);
                         self.input_mouse(me, self.inner.id());
                     }
                     self.update_auto_disconnect_timer();
@@ -2014,6 +2016,12 @@ impl Connection {
                 }
                 Some(message::Union::FileAction(fa)) => {
                     if self.file_transfer.is_some() {
+                        if self.delayed_read_dir.is_some() {
+                            if let Some(file_action::Union::ReadDir(rd)) = fa.union {
+                                self.delayed_read_dir = Some((rd.path, rd.include_hidden));
+                            }
+                            return true;
+                        }
                         match fa.union {
                             Some(file_action::Union::ReadDir(rd)) => {
                                 self.read_dir(&rd.path, rd.include_hidden);
@@ -2054,7 +2062,8 @@ impl Connection {
                                         job.is_remote = true;
                                         job.conn_id = self.inner.id();
                                         self.read_jobs.push(job);
-                                        self.file_timer = time::interval(MILLI1);
+                                        self.file_timer =
+                                            crate::rustdesk_interval(time::interval(MILLI1));
                                         self.post_file_audit(
                                             FileAuditType::RemoteSend,
                                             &s.path,
@@ -2303,6 +2312,33 @@ impl Connection {
                         .lock()
                         .unwrap()
                         .user_record(self.inner.id(), status),
+                    #[cfg(windows)]
+                    Some(misc::Union::SelectedSid(sid)) => {
+                        if let Some(current_process_sid) =
+                            crate::platform::get_current_process_session_id()
+                        {
+                            let sessions = crate::platform::get_available_sessions(false);
+                            if crate::platform::is_installed()
+                                && crate::platform::is_share_rdp()
+                                && raii::AuthedConnID::remote_and_file_conn_count() == 1
+                                && sessions.len() > 1
+                                && current_process_sid != sid
+                                && sessions.iter().any(|e| e.sid == sid)
+                            {
+                                std::thread::spawn(move || {
+                                    let _ = ipc::connect_to_user_session(Some(sid));
+                                });
+                                return false;
+                            }
+                            if self.file_transfer.is_some() {
+                                if let Some((dir, show_hidden)) = self.delayed_read_dir.take() {
+                                    self.read_dir(&dir, show_hidden);
+                                }
+                            } else {
+                                self.try_sub_services();
+                            }
+                        }
+                    }
                     _ => {}
                 },
                 Some(message::Union::AudioFrame(frame)) => {
@@ -3086,7 +3122,6 @@ async fn start_ipc(
     tx_from_cm: mpsc::UnboundedSender<ipc::Data>,
     mut _rx_desktop_ready: mpsc::Receiver<()>,
     tx_stream_ready: mpsc::Sender<()>,
-    user_session_id: Option<u32>,
 ) -> ResultType<()> {
     use hbb_common::anyhow::anyhow;
 
@@ -3134,7 +3169,7 @@ async fn start_ipc(
         if crate::platform::is_root() {
             let mut res = Ok(None);
             for _ in 0..10 {
-                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+                #[cfg(not(any(target_os = "linux")))]
                 {
                     log::debug!("Start cm");
                     res = crate::platform::run_as_user(args.clone());
@@ -3148,14 +3183,10 @@ async fn start_ipc(
                         None::<(&str, &str)>,
                     );
                 }
-                #[cfg(target_os = "windows")]
-                {
-                    log::debug!("Start cm");
-                    res = crate::platform::run_as_user(args.clone(), user_session_id);
-                }
                 if res.is_ok() {
                     break;
                 }
+                log::error!("Failed to run cm: {res:?}");
                 sleep(1.).await;
             }
             if let Some(task) = res? {
@@ -3486,6 +3517,54 @@ extern "C" fn connection_shutdown_hook() {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct Retina {
+    displays: Vec<DisplayInfo>,
+}
+
+#[cfg(target_os = "macos")]
+impl Retina {
+    #[inline]
+    fn set_displays(&mut self, displays: &Vec<DisplayInfo>) {
+        self.displays = displays.clone();
+    }
+
+    #[inline]
+    fn on_mouse_event(&mut self, e: &mut MouseEvent, current: usize) {
+        let Some(d) = self.displays.get(current) else {
+            return;
+        };
+        let s = d.scale;
+        if s > 1.0 && e.x >= d.x && e.y >= d.y && e.x < d.x + d.width && e.y < d.y + d.height {
+            e.x = d.x + ((e.x - d.x) as f64 / s) as i32;
+            e.y = d.y + ((e.y - d.y) as f64 / s) as i32;
+        }
+    }
+
+    #[inline]
+    fn on_cursor_pos(&mut self, pos: &CursorPosition, current: usize) -> Option<Message> {
+        let Some(d) = self.displays.get(current) else {
+            return None;
+        };
+        let s = d.scale;
+        if s > 1.0
+            && pos.x >= d.x
+            && pos.y >= d.y
+            && (pos.x - d.x) as f64 * s < d.width as f64
+            && (pos.y - d.y) as f64 * s < d.height as f64
+        {
+            let mut pos = pos.clone();
+            pos.x = d.x + ((pos.x - d.x) as f64 * s) as i32;
+            pos.y = d.y + ((pos.y - d.y) as f64 * s) as i32;
+            let mut msg = Message::new();
+            msg.set_cursor_position(pos);
+            return Some(msg);
+        }
+        None
+    }
+}
+
 mod raii {
     // CONN_COUNT: remote connection count in fact
     // ALIVE_CONNS: all connections, including unauthorized connections
@@ -3539,6 +3618,15 @@ mod raii {
                 .unwrap()
                 .send((conn_count, remote_count)));
         }
+
+        pub fn remote_and_file_conn_count() -> usize {
+            AUTHED_CONNS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.1 == AuthConnType::Remote || c.1 == AuthConnType::FileTransfer)
+                .count()
+        }
     }
 
     impl Drop for AuthedConnID {
@@ -3565,5 +3653,42 @@ mod raii {
             }
             Self::check_wake_lock();
         }
+    }
+}
+
+mod test {
+    #[allow(unused)]
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn retina() {
+        let mut retina = Retina {
+            displays: vec![DisplayInfo {
+                x: 10,
+                y: 10,
+                width: 1000,
+                height: 1000,
+                scale: 2.0,
+                ..Default::default()
+            }],
+        };
+        let mut mouse: MouseEvent = MouseEvent {
+            x: 510,
+            y: 510,
+            ..Default::default()
+        };
+        retina.on_mouse_event(&mut mouse, 0);
+        assert_eq!(mouse.x, 260);
+        assert_eq!(mouse.y, 260);
+        let pos = CursorPosition {
+            x: 260,
+            y: 260,
+            ..Default::default()
+        };
+        let msg = retina.on_cursor_pos(&pos, 0).unwrap();
+        let pos = msg.cursor_position();
+        assert_eq!(pos.x, 510);
+        assert_eq!(pos.y, 510);
     }
 }

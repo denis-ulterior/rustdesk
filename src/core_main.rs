@@ -22,15 +22,6 @@ macro_rules! my_println{
     };
 }
 
-#[inline]
-fn is_empty_uni_link(arg: &str) -> bool {
-    let prefix = crate::get_uri_prefix();
-    if !arg.starts_with(&prefix) {
-        return false;
-    }
-    arg[prefix.len()..].chars().all(|c| c == '/')
-}
-
 /// shared by flutter and sciter main function
 ///
 /// [Note]
@@ -128,6 +119,7 @@ pub fn core_main() -> Option<Vec<String>> {
         _is_quick_support |= !crate::platform::is_installed()
             && args.is_empty()
             && (arg_exe.to_lowercase().contains("-qs-")
+                || config::LocalConfig::get_option("pre-elevate-service") == "Y"
                 || (!click_setup && crate::platform::is_elevated(None).unwrap_or(false)));
         crate::portable_service::client::set_quick_support(_is_quick_support);
     }
@@ -167,7 +159,7 @@ pub fn core_main() -> Option<Vec<String>> {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     init_plugins(&args);
     log::info!("main start args:{:?}", args);
-    if args.is_empty() || is_empty_uni_link(&args[0]) {
+    if args.is_empty() || crate::common::is_empty_uni_link(&args[0]) {
         std::thread::spawn(move || crate::start_server(false));
     } else {
         #[cfg(windows)]

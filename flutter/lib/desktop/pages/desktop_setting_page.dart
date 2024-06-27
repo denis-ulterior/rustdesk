@@ -315,11 +315,11 @@ class _GeneralState extends State<_General> {
           children: [
             service(),
             theme(),
+            _Card(title: 'Language', children: [language()]),
             hwcodec(),
             audio(context),
             record(context),
             WaylandCard(),
-            _Card(title: 'Language', children: [language()]),
             other()
           ],
         ).marginOnly(bottom: _kListViewBottomMargin));
@@ -413,6 +413,12 @@ class _GeneralState extends State<_General> {
             'Check for software update on startup',
             kOptionEnableCheckUpdate,
             isServer: false,
+          ),
+        if (isWindows && !bind.isOutgoingOnly())
+          _OptionCheckBox(
+            context,
+            'Capture screen using DirectX',
+            kOptionDirectxCapture,
           )
       ],
     ];
@@ -504,9 +510,9 @@ class _GeneralState extends State<_General> {
   Widget record(BuildContext context) {
     final showRootDir = isWindows && bind.mainIsInstalled();
     return futureBuilder(future: () async {
-      String user_dir = await bind.mainVideoSaveDirectory(root: false);
+      String user_dir = bind.mainVideoSaveDirectory(root: false);
       String root_dir =
-          showRootDir ? await bind.mainVideoSaveDirectory(root: true) : '';
+          showRootDir ? bind.mainVideoSaveDirectory(root: true) : '';
       bool user_dir_exists = await Directory(user_dir).exists();
       bool root_dir_exists =
           showRootDir ? await Directory(root_dir).exists() : false;
@@ -673,6 +679,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     // Simple temp wrapper for PR check
     tmpWrapper() {
       RxBool has2fa = bind.mainHasValid2FaSync().obs;
+      RxBool hasBot = bind.mainHasValidBotSync().obs;
       update() async {
         has2fa.value = bind.mainHasValid2FaSync();
       }
@@ -681,7 +688,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
         change2fa(callback: update);
       }
 
-      return GestureDetector(
+      final tfa = GestureDetector(
         child: InkWell(
           child: Obx(() => Row(
                 children: [
@@ -702,6 +709,44 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
           onChanged(!has2fa.value);
         },
       ).marginOnly(left: _kCheckBoxLeftMargin);
+      if (!has2fa.value) {
+        return tfa;
+      }
+      updateBot() async {
+        hasBot.value = bind.mainHasValidBotSync();
+      }
+
+      onChangedBot(bool? checked) async {
+        changeBot(callback: updateBot);
+      }
+
+      final bot = GestureDetector(
+        child: Tooltip(
+          waitDuration: Duration(milliseconds: 300),
+          message: translate("enable-bot-tip"),
+          child: InkWell(
+              child: Obx(() => Row(
+                    children: [
+                      Checkbox(
+                              value: hasBot.value,
+                              onChanged: enabled ? onChangedBot : null)
+                          .marginOnly(right: 5),
+                      Expanded(
+                          child: Text(
+                        translate('Telegram bot'),
+                        style: TextStyle(
+                            color: disabledTextColor(context, enabled)),
+                      ))
+                    ],
+                  ))),
+        ),
+        onTap: () {
+          onChangedBot(!hasBot.value);
+        },
+      ).marginOnly(left: _kCheckBoxLeftMargin + 30);
+      return Column(
+        children: [tfa, bot],
+      );
     }
 
     return tmpWrapper();

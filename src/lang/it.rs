@@ -617,5 +617,18 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Use texture rendering", "Usa rendering texture"),
         ("Floating window", "Finestra galleggiante"),
         ("floating_window_tip", "Aiuta a mantenere il servizio di RustDesk in background"),
+        ("Keep screen on", "Mantieni schermo acceso"),
+        ("Never", "Mai"),
+        ("During controlled", "Durante il controllo"),
+        ("During service is on", "Quando il servizio è attivo"),
+        ("Capture screen using DirectX", "Cattura schermo usando DirectX"),
+        ("Back", "Indietro"),
+        ("Apps", "App"),
+        ("Volume up", "Volume +"),
+        ("Volume down", "Volume -"),
+        ("Power", "Alimentazione"),
+        ("Telegram bot", "Bot Telgram"),
+        ("enable-bot-tip", "Se abiliti questa funzione, puoi ricevere il codice 2FA dal tuo bot.\nPuò anche funzionare come notifica di connessione."),
+        ("enable-bot-desc", "1, apri una chat con @BotFather.\n2, Invia il comando \"/newbot\", dopo aver completato questo passaggio riceverai un token.\n3, Avvia una chat con il tuo bot appena creato. Per attivarlo invia un messaggio tipo \"/hello\".\n"),
     ].iter().cloned().collect();
 }

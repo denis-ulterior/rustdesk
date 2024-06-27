@@ -43,8 +43,7 @@ use hbb_common::{
     rand,
     rendezvous_proto::*,
     socket_client,
-    sodiumoxide::base64,
-    sodiumoxide::crypto::sign,
+    sodiumoxide::{base64, crypto::sign},
     tcp::FramedStream,
     timeout,
     tokio::time::Duration,
@@ -1204,6 +1203,7 @@ pub struct LoginConfigHandler {
     pub save_ab_password_to_recent: bool, // true: connected with ab password
     pub other_server: Option<(String, String, String)>,
     pub custom_fps: Arc<Mutex<Option<usize>>>,
+    pub last_auto_fps: Option<usize>,
     pub adapter_luid: Option<i64>,
     pub mark_unsupported: Vec<CodecFormat>,
     pub selected_windows_session_id: Option<u32>,
@@ -1286,7 +1286,9 @@ impl LoginConfigHandler {
         self.session_id = sid;
         self.supported_encoding = Default::default();
         self.restarting_remote_device = false;
-        self.force_relay = !self.get_option("force-always-relay").is_empty() || force_relay;
+        self.force_relay =
+            config::option2bool("force-always-relay", &self.get_option("force-always-relay"))
+                || force_relay;
         if let Some((real_id, server, key)) = &self.other_server {
             let other_server_key = self.get_option("other-server-key");
             if !other_server_key.is_empty() && key.is_empty() {
@@ -1451,6 +1453,10 @@ impl LoginConfigHandler {
     /// # Arguments
     ///
     /// * `name` - The name of the option to toggle.
+    ///
+    // It's Ok to check the option empty in this function.
+    // `toggle_option()` is only called in a session.
+    // Custom client advanced settings will not affact this function.
     pub fn toggle_option(&mut self, name: String) -> Option<Message> {
         let mut option = OptionMessage::default();
         let mut config = self.load_config();
@@ -1707,6 +1713,10 @@ impl LoginConfigHandler {
     /// # Arguments
     ///
     /// * `name` - The name of the toggle option.
+    ///
+    // It's Ok to check the option empty in this function.
+    // `get_toggle_option()` is only called in a session.
+    // Custom client advanced settings will not affact this function.
     pub fn get_toggle_option(&self, name: &str) -> bool {
         if name == "show-remote-cursor" {
             self.config.show_remote_cursor.v
@@ -2083,8 +2093,6 @@ pub type MediaSender = mpsc::Sender<MediaData>;
 
 struct VideoHandlerController {
     handler: VideoHandler,
-    count: u128,
-    duration: std::time::Duration,
     skip_beginning: u32,
 }
 
@@ -2101,7 +2109,7 @@ pub fn start_video_audio_threads<F, T>(
     MediaSender,
     MediaSender,
     Arc<RwLock<HashMap<usize, ArrayQueue<VideoFrame>>>>,
-    Arc<RwLock<HashMap<usize, usize>>>,
+    Arc<RwLock<Option<usize>>>,
     Arc<RwLock<Option<Chroma>>>,
 )
 where
@@ -2113,8 +2121,8 @@ where
     let video_queue_map_cloned = video_queue_map.clone();
     let mut video_callback = video_callback;
 
-    let fps_map = Arc::new(RwLock::new(HashMap::new()));
-    let decode_fps_map = fps_map.clone();
+    let fps = Arc::new(RwLock::new(None));
+    let decode_fps_map = fps.clone();
     let chroma = Arc::new(RwLock::new(None));
     let chroma_cloned = chroma.clone();
     let mut last_chroma = None;
@@ -2122,10 +2130,10 @@ where
     std::thread::spawn(move || {
         #[cfg(windows)]
         sync_cpu_usage();
+        get_hwcodec_config();
         let mut handler_controller_map = HashMap::new();
-        // let mut count = Vec::new();
-        // let mut duration = std::time::Duration::ZERO;
-        // let mut skip_beginning = Vec::new();
+        let mut count = 0;
+        let mut duration = std::time::Duration::ZERO;
         loop {
             if let Ok(data) = video_receiver.recv() {
                 match data {
@@ -2158,8 +2166,6 @@ where
                                 display,
                                 VideoHandlerController {
                                     handler: VideoHandler::new(format, display),
-                                    count: 0,
-                                    duration: std::time::Duration::ZERO,
                                     skip_beginning: 0,
                                 },
                             );
@@ -2167,6 +2173,8 @@ where
                         if let Some(handler_controller) = handler_controller_map.get_mut(&display) {
                             let mut pixelbuffer = true;
                             let mut tmp_chroma = None;
+                            let format_changed =
+                                handler_controller.handler.decoder.format() != format;
                             match handler_controller.handler.handle_frame(
                                 vf,
                                 &mut pixelbuffer,
@@ -2187,27 +2195,14 @@ where
                                     }
 
                                     // fps calculation
-                                    // The first frame will be very slow
-                                    if handler_controller.skip_beginning < 5 {
-                                        handler_controller.skip_beginning += 1;
-                                        continue;
-                                    }
-
-                                    handler_controller.duration += start.elapsed();
-                                    handler_controller.count += 1;
-                                    if handler_controller.count % 10 == 0 {
-                                        fps_map.write().unwrap().insert(
-                                            display,
-                                            (handler_controller.count * 1000
-                                                / handler_controller.duration.as_millis())
-                                                as usize,
-                                        );
-                                    }
-                                    // Clear to get real-time fps
-                                    if handler_controller.count > 150 {
-                                        handler_controller.count = 0;
-                                        handler_controller.duration = Duration::ZERO;
-                                    }
+                                    fps_calculate(
+                                        handler_controller,
+                                        &fps,
+                                        format_changed,
+                                        start.elapsed(),
+                                        &mut count,
+                                        &mut duration,
+                                    );
                                 }
                                 Err(e) => {
                                     // This is a simple workaround.
@@ -2321,6 +2316,59 @@ pub fn start_audio_thread() -> MediaSender {
         log::info!("Audio decoder loop exits");
     });
     audio_sender
+}
+
+#[inline]
+fn fps_calculate(
+    handler_controller: &mut VideoHandlerController,
+    fps: &Arc<RwLock<Option<usize>>>,
+    format_changed: bool,
+    elapsed: std::time::Duration,
+    count: &mut usize,
+    duration: &mut std::time::Duration,
+) {
+    if format_changed {
+        *count = 0;
+        *duration = std::time::Duration::ZERO;
+        handler_controller.skip_beginning = 0;
+    }
+    // // The first frame will be very slow
+    if handler_controller.skip_beginning < 3 {
+        handler_controller.skip_beginning += 1;
+        return;
+    }
+    *duration += elapsed;
+    *count += 1;
+    let ms = duration.as_millis();
+    if *count % 10 == 0 && ms > 0 {
+        *fps.write().unwrap() = Some((*count as usize) * 1000 / (ms as usize));
+    }
+    // Clear to get real-time fps
+    if *count >= 30 {
+        *count = 0;
+        *duration = Duration::ZERO;
+    }
+}
+
+fn get_hwcodec_config() {
+    // for sciter and unilink
+    #[cfg(feature = "hwcodec")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let start = std::time::Instant::now();
+            if let Err(e) = crate::ipc::get_hwcodec_config_from_server() {
+                log::error!(
+                    "failed to get hwcodec config: {e:?}, elapsed: {:?}",
+                    start.elapsed()
+                );
+            } else {
+                log::info!("{:?} used to get hwcodec config", start.elapsed());
+            }
+        });
+    }
 }
 
 #[cfg(windows)]

@@ -274,7 +274,7 @@ pub fn session_toggle_option(session_id: SessionID, value: String) {
         session.toggle_option(value.clone());
         try_sync_peer_option(&session, &session_id, &value, None);
     }
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     if sessions::get_session_by_session_id(&session_id).is_some() && value == "disable-clipboard" {
         crate::flutter::update_text_clipboard_required();
     }
@@ -774,13 +774,6 @@ pub fn main_get_sound_inputs() -> Vec<String> {
     vec![String::from("")]
 }
 
-pub fn main_get_default_sound_input() -> Option<String> {
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    return get_default_sound_input();
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    None
-}
-
 pub fn main_get_login_device_info() -> SyncReturn<String> {
     SyncReturn(get_login_device_info_json())
 }
@@ -817,6 +810,17 @@ pub fn main_show_option(_key: String) -> SyncReturn<bool> {
     SyncReturn(false)
 }
 
+#[inline]
+#[cfg(target_os = "android")]
+fn enable_server_clipboard(keyboard_enabled: &str, clip_enabled: &str) {
+    use scrap::android::ffi::call_clipboard_manager_enable_service_clipboard;
+    let keyboard_enabled =
+        config::option2bool(config::keys::OPTION_ENABLE_KEYBOARD, &keyboard_enabled);
+    let clip_enabled = config::option2bool(config::keys::OPTION_ENABLE_CLIPBOARD, &clip_enabled);
+    crate::ui_cm_interface::switch_permission_all("clipboard".to_owned(), clip_enabled);
+    let _ = call_clipboard_manager_enable_service_clipboard(keyboard_enabled && clip_enabled);
+}
+
 pub fn main_set_option(key: String, value: String) {
     #[cfg(target_os = "android")]
     if key.eq(config::keys::OPTION_ENABLE_KEYBOARD) {
@@ -824,6 +828,11 @@ pub fn main_set_option(key: String, value: String) {
             config::keys::OPTION_ENABLE_KEYBOARD,
             &value,
         ));
+        enable_server_clipboard(&value, &get_option(config::keys::OPTION_ENABLE_CLIPBOARD));
+    }
+    #[cfg(target_os = "android")]
+    if key.eq(config::keys::OPTION_ENABLE_CLIPBOARD) {
+        enable_server_clipboard(&get_option(config::keys::OPTION_ENABLE_KEYBOARD), &value);
     }
     if key.eq("custom-rendezvous-server") {
         set_option(key, value.clone());
@@ -2299,6 +2308,16 @@ pub fn session_request_new_display_init_msgs(session_id: SessionID, display: usi
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         session.request_init_msgs(display);
     }
+}
+
+pub fn main_audio_support_loopback() -> SyncReturn<bool> {
+    #[cfg(target_os = "windows")]
+    let is_surpport = true;
+    #[cfg(feature = "screencapturekit")]
+    let is_surpport = crate::audio_service::is_screen_capture_kit_available();
+    #[cfg(not(any(target_os = "windows", feature = "screencapturekit")))]
+    let is_surpport = false;
+    SyncReturn(is_surpport)
 }
 
 #[cfg(target_os = "android")]

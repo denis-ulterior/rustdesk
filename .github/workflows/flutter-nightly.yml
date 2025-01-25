@@ -2,8 +2,8 @@ name: Flutter Nightly Build
 
 on:
   schedule:
-    # schedule build every night
-    - cron: "0 0 * * *"
+    # schedule build 
+    - cron: "0 0 */15 * *"
   workflow_dispatch:
 
 jobs:
